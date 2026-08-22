@@ -1,0 +1,17 @@
+name: Daily Spike
+on:
+  schedule:
+    - cron: '30 14 * * 1-5' # Roz 8:00 PM IST = 2:30 PM UTC, Mon-Fri
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.9' }
+      - run: pip install pandas requests
+      - run: python scanner.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.CHAT_ID }}
