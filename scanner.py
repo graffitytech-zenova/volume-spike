@@ -30,7 +30,7 @@ for i in range(45):
             df['DEL%'] = df['DELIV_QTY'] / df['TTL_TRD_QNTY'] * 100
             cols = ['DATE','SYMBOL','CLOSE_PRICE','DELIV_QTY','TTL_TRD_QNTY','DEL%']
             all_data.append(df[cols])
-    except Exception as e:
+    except:
         print("Skip")
     time.sleep(0.5)
 
@@ -38,7 +38,6 @@ full = pd.concat(all_data)
 full = full.sort_values(['SYMBOL','DATE'])
 latest_date = full['DATE'].max()
 
-# AVG 30D calculation without apply
 full['AVG_30D'] = 0.0
 for sym in full['SYMBOL'].unique():
     mask = full['SYMBOL'] == sym
@@ -48,10 +47,15 @@ for sym in full['SYMBOL'].unique():
 
 full['SPIKE'] = full['DELIV_QTY'] / full['AVG_30D']
 
-EXCLUDE = 'BEES|ETF|GOLD|LIQUID|NIFTY|GILT|REIT|INVIT|BOND|SETF|MAMC|SENSEX|HNGSNGBEES'
+EXCLUDE = 'BEES|ETF|GOLD|LIQUID|NIFTY|GILT|REIT|INVIT|BOND|SETF|MAMC|SENSEX|HNGSNGBEES|BSE500|NIF100|NIF50|NEXT50'
 full = full[~full['SYMBOL'].str.contains(EXCLUDE, case=False, na=False)]
 
-# Follow-up logic
+# 1. ACCUMULATION ALERT - Aaj ka spike
+latest = full[full['DATE'] == latest_date]
+acc = latest[(latest['SPIKE'] >= 4) & (latest['DEL%'] >= 60) & (latest['DELIV_QTY'] > 30000) & (latest['CLOSE_PRICE'] > 30)]
+acc = acc.sort_values('SPIKE', ascending=False).head(15)
+
+# 2. MOMENTUM ALERT - Follow up buying
 results = []
 for sym, g in full.groupby('SYMBOL'):
     g = g.sort_values('DATE')
@@ -65,33 +69,47 @@ for sym, g in full.groupby('SYMBOL'):
     spike_close = spike_row['CLOSE_PRICE']
     after = g[g['DATE'] > spike_date].sort_values('DATE')
     if after.empty:
-        follow_days = 0
-        hold_pct = 0.0
-        latest_close = spike_close
-    else:
-        cond2 = (after['DEL%'] >= 50) & (after['DELIV_QTY'] >= after['AVG_30D'] * 0.8)
-        follow_days = len(after[cond2])
-        latest_close = after['CLOSE_PRICE'].iloc[-1]
-        hold_pct = (latest_close - spike_close) / spike_close * 100
+        continue
+    cond2 = (after['DEL%'] >= 50) & (after['DELIV_QTY'] >= after['AVG_30D'] * 0.8)
+    follow_days = len(after[cond2])
+    latest_close = after['CLOSE_PRICE'].iloc[-1]
+    hold_pct = (latest_close - spike_close) / spike_close * 100
     if follow_days >= 1 and hold_pct >= -2.5:
         results.append({
             'SYMBOL': sym,
             'SPIKE': spike_row['SPIKE'],
-            'SPIKE_DATE': spike_date,
             'FOLLOW_UP': follow_days,
             'HOLD%': hold_pct,
             'LATEST_CLOSE': latest_close
         })
 
-final_df = pd.DataFrame(results)
-if not final_df.empty:
-    final_df = final_df.sort_values(['FOLLOW_UP','SPIKE'], ascending=[False, False]).head(15)
-    msg = "Momentum Alert %s\n\n" % str(latest_date.date())
-    for _, r in final_df.iterrows():
-        arrow = "🟢" if r['HOLD%'] >= 0 else "🔴"
-        msg = msg + "%s %s Spike %.1fx Follow %s/3 Hold %+.1f%% Rs%.0f\n" % (arrow, r['SYMBOL'], r['SPIKE'], r['FOLLOW_UP'], r['HOLD%'], r['LATEST_CLOSE'])
-    print(msg)
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        requests.post("https://api.telegram.org/bot%s/sendMessage" % TELEGRAM_TOKEN, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-else:
-    print("No momentum stocks today")
+mom_df = pd.DataFrame(results)
+if not mom_df.empty:
+    mom_df = mom_df.sort_values(['FOLLOW_UP','SPIKE'], ascending=[False, False]).head(10)
+
+# 3. SINGLE TELEGRAM MESSAGE
+msg = ""
+if not acc.empty:
+    msg = msg + "🔥 Accumulation Alert %s (30D)\n\n" % str(latest_date.date())
+    for _, r in acc.iterrows():
+        # Calculate day change
+        try:
+            prev_close = full[(full['SYMBOL']==r['SYMBOL']) & (full['DATE']<latest_date)].sort_values('DATE').iloc[-1]['CLOSE_PRICE']
+            chg = (r['CLOSE_PRICE'] - prev_close) / prev_close * 100
+        except:
+            chg = 0
+        dot = "🟢" if chg >= 0 else "🔴"
+        msg = msg + "%s %s %.1fx | %.0f%% | %+.1f%% | Rs%.0f\n" % (dot, r['SYMBOL'], r['SPIKE'], r['DEL%'], chg, r['CLOSE_PRICE'])
+
+if not mom_df.empty:
+    msg = msg + "\n💪 Momentum Alert %s (Follow-up)\n\n" % str(latest_date.date())
+    for _, r in mom_df.iterrows():
+        dot = "🟢" if r['HOLD%'] >= 0 else "🔴"
+        msg = msg + "%s %s Spike %.1fx Follow %s/3 Hold %+.1f%% Rs%.0f\n" % (dot, r['SYMBOL'], r['SPIKE'], r['FOLLOW_UP'], r['HOLD%'], r['LATEST_CLOSE'])
+
+if msg == "":
+    msg = "No accumulation/momentum today"
+
+print(msg)
+if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+    requests.post("https://api.telegram.org/bot%s/sendMessage" % TELEGRAM_TOKEN, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
