@@ -1,4 +1,7 @@
-import pandas as pd, requests, time, os
+import pandas as pd
+import requests
+import time
+import os
 from datetime import datetime, timedelta
 from io import StringIO
 
@@ -12,33 +15,83 @@ s.get("https://www.nseindia.com/all-reports", headers=headers)
 all_data = []
 for i in range(45):
     d = datetime.now() - timedelta(days=i)
-    if d.weekday() >= 5: continue
-    url = f"https://archives.nseindia.com/products/content/sec_bhavdata_full_{d.strftime('%d%m%Y')}.csv"
+    if d.weekday() >= 5:
+        continue
+    url = "https://archives.nseindia.com/products/content/sec_bhavdata_full_%s.csv" % d.strftime('%d%m%Y')
     try:
         r = s.get(url, headers=headers, timeout=15)
-        if r.status_code==200 and 'SYMBOL' in r.text[:100]:
+        if r.status_code == 200 and 'SYMBOL' in r.text[:100]:
             df = pd.read_csv(StringIO(r.text))
             df.columns = [c.strip() for c in df.columns]
-            df = df[df['SERIES'].astype(str).str.strip()=='EQ']
+            df = df[df['SERIES'].astype(str).str.strip() == 'EQ']
             for c in ['DELIV_QTY','TTL_TRD_QNTY','CLOSE_PRICE']:
                 df[c] = pd.to_numeric(df[c].astype(str).str.replace(',',''), errors='coerce')
             df['DATE'] = pd.to_datetime(d.date())
-            df['DEL%'] = df['DELIV_QTY']/df['TTL_TRD_QNTY']*100
-            all_data.append(df[['DATE','SYMBOL','CLOSE_PRICE','DELIV_QTY','TTL_TRD_QNTY','DEL%']])
+            df['DEL%'] = df['DELIV_QTY'] / df['TTL_TRD_QNTY'] * 100
+            cols = ['DATE','SYMBOL','CLOSE_PRICE','DELIV_QTY','TTL_TRD_QNTY','DEL%']
+            all_data.append(df[cols])
     except Exception as e:
-        print(f"Skip {d.date()} {e}")
+        print("Skip")
     time.sleep(0.5)
 
-if not all_data:
-    print("No data fetched")
-    exit()
-
-full = pd.concat(all_data).sort_values(['SYMBOL','DATE'])
+full = pd.concat(all_data)
+full = full.sort_values(['SYMBOL','DATE'])
 latest_date = full['DATE'].max()
 
-def calc_avg(g):
-    g = g.sort_values('DATE')
-    g['AVG_30D'] = g['DELIV_QTY'].shift(1).rolling(30, min_periods=10).mean()
-    return g
+# AVG 30D calculation without apply
+full['AVG_30D'] = 0.0
+for sym in full['SYMBOL'].unique():
+    mask = full['SYMBOL'] == sym
+    sub = full[mask].sort_values('DATE')
+    avg_vals = sub['DELIV_QTY'].shift(1).rolling(30, min_periods=10).mean()
+    full.loc[mask, 'AVG_30D'] = avg_vals.values
 
-full = full.groupby('SYMBOL', group_keys=False).
+full['SPIKE'] = full['DELIV_QTY'] / full['AVG_30D']
+
+EXCLUDE = 'BEES|ETF|GOLD|LIQUID|NIFTY|GILT|REIT|INVIT|BOND|SETF|MAMC|SENSEX|HNGSNGBEES'
+full = full[~full['SYMBOL'].str.contains(EXCLUDE, case=False, na=False)]
+
+# Follow-up logic
+results = []
+for sym, g in full.groupby('SYMBOL'):
+    g = g.sort_values('DATE')
+    recent = g[g['DATE'] >= latest_date - timedelta(days=7)]
+    cond = (recent['SPIKE'] >= 2.5) & (recent['DEL%'] >= 60) & (recent['DELIV_QTY'] > 50000) & (recent['CLOSE_PRICE'] > 30)
+    spikes = recent[cond]
+    if spikes.empty:
+        continue
+    spike_row = spikes.sort_values('DATE').iloc[-1]
+    spike_date = spike_row['DATE']
+    spike_close = spike_row['CLOSE_PRICE']
+    after = g[g['DATE'] > spike_date].sort_values('DATE')
+    if after.empty:
+        follow_days = 0
+        hold_pct = 0.0
+        latest_close = spike_close
+    else:
+        cond2 = (after['DEL%'] >= 50) & (after['DELIV_QTY'] >= after['AVG_30D'] * 0.8)
+        follow_days = len(after[cond2])
+        latest_close = after['CLOSE_PRICE'].iloc[-1]
+        hold_pct = (latest_close - spike_close) / spike_close * 100
+    if follow_days >= 1 and hold_pct >= -2.5:
+        results.append({
+            'SYMBOL': sym,
+            'SPIKE': spike_row['SPIKE'],
+            'SPIKE_DATE': spike_date,
+            'FOLLOW_UP': follow_days,
+            'HOLD%': hold_pct,
+            'LATEST_CLOSE': latest_close
+        })
+
+final_df = pd.DataFrame(results)
+if not final_df.empty:
+    final_df = final_df.sort_values(['FOLLOW_UP','SPIKE'], ascending=[False, False]).head(15)
+    msg = "Momentum Alert %s\n\n" % str(latest_date.date())
+    for _, r in final_df.iterrows():
+        arrow = "🟢" if r['HOLD%'] >= 0 else "🔴"
+        msg = msg + "%s %s Spike %.1fx Follow %s/3 Hold %+.1f%% Rs%.0f\n" % (arrow, r['SYMBOL'], r['SPIKE'], r['FOLLOW_UP'], r['HOLD%'], r['LATEST_CLOSE'])
+    print(msg)
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        requests.post("https://api.telegram.org/bot%s/sendMessage" % TELEGRAM_TOKEN, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+else:
+    print("No momentum stocks today")
